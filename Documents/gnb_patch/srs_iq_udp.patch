@@ -1,0 +1,151 @@
+diff --git a/lib/phy/upper/signal_processors/srs/srs_estimator_generic_impl.cpp b/lib/phy/upper/signal_processors/srs/srs_estimator_generic_impl.cpp
+index 220b4b8..81f83bd 100644
+--- a/lib/phy/upper/signal_processors/srs/srs_estimator_generic_impl.cpp
++++ b/lib/phy/upper/signal_processors/srs/srs_estimator_generic_impl.cpp
+@@ -21,6 +21,7 @@
+  */
+ 
+ #include "srs_estimator_generic_impl.h"
++#include "srs_iq_udp.h"
+ #include "srs_validator_generic_impl.h"
+ #include "srsran/adt/complex.h"
+ #include "srsran/adt/expected.h"
+@@ -279,5 +280,27 @@ srs_estimator_result srs_estimator_generic_impl::estimate(const resource_grid_re
+   result.epre_dB        = convert_power_to_dB(epre);
+   result.rsrp_dB        = convert_power_to_dB(rsrp);
+ 
++  // Export per-subcarrier channel estimate (Tx port 0, every Rx port) over UDP.
++  if (srs_iq::get().enabled()) {
++    srs_iq::header h{};
++    h.rnti         = srs_iq::cur_rnti;
++    h.sfn          = static_cast<uint16_t>(config.slot.sfn());
++    h.slot         = static_cast<uint8_t>(config.slot.slot_index());
++    h.numerology   = static_cast<uint8_t>(config.slot.numerology());
++    h.start_symbol = config.resource.start_symbol.value();
++    h.nof_symbols  = static_cast<uint8_t>(nof_symbols);
++    h.comb         = static_cast<uint8_t>(comb_size);
++    h.first_sc     = static_cast<uint16_t>(info_port0.mapping_initial_subcarrier);
++    h.ta_us        = static_cast<float>(result.time_alignment.time_alignment * 1e6);
++    h.epre_db      = convert_power_to_dB(epre);
++    h.rsrp_db      = convert_power_to_dB(rsrp);
++    h.noise_var    = noise_var;
++    for (unsigned i_rx = 0; i_rx != nof_rx_ports; ++i_rx) {
++      span<const cf_t> lse = temp_lse.get_view({i_rx, 0U});
++      h.rx_port            = config.ports[i_rx];
++      srs_iq::get().send(h, lse.data(), lse.size());
++    }
++  }
++
+   return result;
+ }
+diff --git a/lib/phy/upper/signal_processors/srs/srs_iq_udp.h b/lib/phy/upper/signal_processors/srs/srs_iq_udp.h
+new file mode 100644
+index 0000000..285f22a
+--- /dev/null
++++ b/lib/phy/upper/signal_processors/srs/srs_iq_udp.h
+@@ -0,0 +1,85 @@
++// srs_iq_udp.h - send per-subcarrier SRS channel estimates as UDP datagrams.
++// Enabled only when the environment variable SRS_IQ_PORT is set (e.g. SRS_IQ_PORT=50000).
++// One datagram per (SRS PDU, rx port), sent non-blocking to 127.0.0.1; if nobody
++// is listening or the socket buffer is full, the packet is simply lost.
++#pragma once
++#include <arpa/inet.h>
++#include <complex>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++namespace srs_iq {
++
++inline thread_local uint16_t cur_rnti = 0; // set by uplink_processor before estimate()
++
++constexpr unsigned MAX_SC = 1632; // 272 PRB, comb 2
++
++#pragma pack(push, 1)
++struct header {
++  char     magic[4];   // "SRSQ"
++  uint16_t version;    // 1
++  uint16_t rnti;
++  uint16_t sfn;
++  uint8_t  slot;
++  uint8_t  numerology;
++  uint8_t  rx_port;
++  uint8_t  start_symbol;
++  uint8_t  nof_symbols;
++  uint8_t  comb;
++  uint16_t first_sc;   // initial subcarrier of the comb
++  uint16_t n_sc;       // number of complex samples that follow
++  float    ta_us;      // estimated time alignment (already compensated in the samples)
++  float    epre_db;
++  float    rsrp_db;
++  float    noise_var;
++  double   host_time;  // CLOCK_REALTIME, seconds
++};
++#pragma pack(pop)
++
++class sender {
++  int         fd = -1;
++  sockaddr_in dst{};
++
++public:
++  sender()
++  {
++    const char* p = std::getenv("SRS_IQ_PORT");
++    if (!p) return;
++    fd = ::socket(AF_INET, SOCK_DGRAM, 0);
++    dst.sin_family = AF_INET;
++    dst.sin_port   = htons(static_cast<uint16_t>(std::atoi(p)));
++    inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr);
++  }
++  ~sender() { if (fd >= 0) ::close(fd); }
++  bool enabled() const { return fd >= 0; }
++
++  void send(header h, const std::complex<float>* iq, unsigned n)
++  {
++    if (fd < 0) return;
++    if (n > MAX_SC) n = MAX_SC;
++    alignas(8) uint8_t buf[sizeof(header) + MAX_SC * sizeof(std::complex<float>)];
++    std::memcpy(h.magic, "SRSQ", 4);
++    h.version = 1;
++    h.n_sc    = static_cast<uint16_t>(n);
++    timespec ts;
++    clock_gettime(CLOCK_REALTIME, &ts);
++    h.host_time = ts.tv_sec + ts.tv_nsec * 1e-9;
++    std::memcpy(buf, &h, sizeof(h));
++    std::memcpy(buf + sizeof(h), iq, n * sizeof(std::complex<float>));
++    ::sendto(fd, buf, sizeof(h) + n * sizeof(std::complex<float>), MSG_DONTWAIT,
++             reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
++  }
++};
++
++inline sender& get()
++{
++  static thread_local sender s; // one socket per PHY worker thread, no locking
++  return s;
++}
++
++} // namespace srs_iq
+diff --git a/lib/phy/upper/uplink_processor_impl.cpp b/lib/phy/upper/uplink_processor_impl.cpp
+index 0a6f80a..2011024 100644
+--- a/lib/phy/upper/uplink_processor_impl.cpp
++++ b/lib/phy/upper/uplink_processor_impl.cpp
+@@ -21,6 +21,7 @@
+  */
+ 
+ #include "uplink_processor_impl.h"
++#include "signal_processors/srs/srs_iq_udp.h"
+ #include "srsran/adt/scope_exit.h"
+ #include "srsran/instrumentation/traces/du_traces.h"
+ #include "srsran/phy/support/prach_buffer.h"
+@@ -463,6 +464,7 @@ void uplink_processor_impl::process_srs(const uplink_pdu_slot_repository::srs_pd
+ 
+     ul_srs_results result;
+     result.context          = pdu.context;
++    srs_iq::cur_rnti        = to_value(pdu.context.rnti);
+     result.processor_result = srs->estimate(grid->get_reader(), pdu.config);
+ 
+     l1_ul_tracer << trace_event("process_srs", tp);
